@@ -1134,6 +1134,11 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
         vllm_config = get_current_vllm_config()
         self._attn_out_dtype = vllm_config.model_config.dtype
         if isinstance(self.index_group, HiSparseMLAIndexGroup):
+            if kv_cache_dtype == "fp8_ds_mla":
+                raise ValueError(
+                    "HiSparse on ROCm does not support the fp8_ds_mla KV cache "
+                    "dtype; use auto, bfloat16, or fp8."
+                )
             # HiSparse row ids can exceed the int32 range AITER's ASM sparse
             # kernels address, so it only uses int64-safe Triton kernels.
             logger.info_once(

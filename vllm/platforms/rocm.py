@@ -1224,6 +1224,10 @@ class RocmPlatform(Platform):
         os.environ["VLLM_USE_TRITON_AWQ"] = "1"
 
     @classmethod
+    def get_hisparse_backend_cls(cls) -> str | None:
+        return "vllm.v1.hisparse.backend.ROCmHiSparseBackend"
+
+    @classmethod
     def get_punica_wrapper(cls) -> str:
         return "vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU"
 

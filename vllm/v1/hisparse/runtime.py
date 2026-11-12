@@ -101,9 +101,12 @@ class PagedCacheView:
         row_bytes = row_width * itemsize
         if block_stride % (block_size * row_bytes):
             return cls(cache, cache, block_size, block_size)
-        attention_cache = (
-            raw_tensor[byte_offset:].view(dtype).view(-1, block_size, row_width)
-        )
+        # The backing may be padded past its last whole block (ROCm rounds it
+        # to a page); drop that tail so the reshape stays exact.
+        tail = raw_tensor[byte_offset:].view(dtype)
+        block_numel = block_size * row_width
+        tail = tail[: tail.numel() // block_numel * block_numel]
+        attention_cache = tail.view(-1, block_size, row_width)
         return cls(cache, attention_cache, block_size, block_stride // row_bytes)
 
 
@@ -179,15 +182,23 @@ def _check_residency_shared_memory(
 ) -> None:
     """Reject a config whose residency resolver exceeds per-block shared memory."""
     # Minimum resolver layout: union hash keys and values (plus an empty slot),
-    # per-chunk offsets, five counters, done bits, and the int16 compacted LRU.
-    # The kernel uses remaining shared memory to lower the hash-table load.
-    hot_size = config.device_buffer_size
-    num_chunks = cdiv(hot_size, 32)
-    required = 4 * (2 * (config.max_union_rows + 1) + 3 * num_chunks + 7) + 2 * hot_size
+    # per-chunk offsets, five counters, one ballot mask per warp-wide chunk
+    # (after worst-case alignment padding), and the int16 compacted LRU. The
+    # kernel uses remaining shared memory to lower the hash-table load.
     device_index = (
         device.index
         if device.index is not None
         else torch.accelerator.current_device_index()
+    )
+    warp_size = getattr(torch.cuda.get_device_properties(device_index), "warp_size", 32)
+    mask_bytes = warp_size // 8
+    hot_size = config.device_buffer_size
+    num_chunks = cdiv(hot_size, warp_size)
+    required = (
+        4 * (2 * (config.max_union_rows + 1) + 2 * num_chunks + 7)
+        + mask_bytes * num_chunks
+        + (mask_bytes - 4)
+        + 2 * hot_size
     )
     available = get_max_shared_memory_bytes(device_index)
     if required > available:
@@ -333,10 +344,15 @@ def allocate_hisparse_host_pools(
         populate_shard=(tp_group.rank_in_group, tp_group.world_size),
         num_segments=REGION_SEGMENTS,
     )
+    backend = get_hisparse_backend()
     pinned: list[torch.Tensor] = []
     try:
         for start, end in host_registration_ranges(
-            tensor_sizes, num_blocks, num_blocks * host_block_stride
+            tensor_sizes,
+            num_blocks,
+            num_blocks * host_block_stride,
+            backend.host_register_chunk_bytes,
+            whole_tensors=backend.register_whole_host_tensors,
         ):
             tensor = region.base_tensor[start:end]
             pin_tensor(tensor)

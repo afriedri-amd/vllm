@@ -22,7 +22,10 @@ def unpin_tensor(tensor: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
     err = cudart.cudaHostUnregister(tensor.data_ptr())
     if err.value != 0:
-        cudart.cudaGetLastError()
+        # Clear the sticky error where the runtime binding exposes it.
+        clear_error = getattr(cudart, "cudaGetLastError", None)
+        if clear_error is not None:
+            clear_error()
         raise RuntimeError(f"cudaHostUnregister failed (code={err.value}).")
 
 
@@ -33,11 +36,14 @@ def host_registration_ranges(
     max_chunk_bytes: int = HOST_REGISTER_CHUNK_BYTES,
     *,
     page_size: int = mmap.PAGESIZE,
+    whole_tensors: bool = False,
 ) -> tuple[tuple[int, int], ...]:
     """Split a shared pool without bisecting any tensor's host block.
 
     Keep registration boundaries aligned to the backing pages. CUDA batch
-    copies reject descriptors spanning adjacent registrations.
+    copies reject descriptors spanning adjacent registrations. With
+    `whole_tensors`, boundaries fall only between tensors, for runtimes whose
+    registrations each get their own device alias.
     """
     if total_size % page_size:
         raise ValueError("Host pool must be page aligned.")
@@ -58,7 +64,22 @@ def host_registration_ranges(
     if tensor_start > total_size:
         raise ValueError("Host tensors exceed the shared host pool.")
 
+    def last_tensor_boundary(lower: int, upper: int) -> int | None:
+        boundaries = [
+            end
+            for _, end, _ in tensors
+            if lower < end <= upper and end % page_size == 0
+        ]
+        if upper >= tensor_start:
+            # Past the last tensor only padding remains.
+            padding_end = upper // page_size * page_size
+            if padding_end >= tensor_start and padding_end > lower:
+                boundaries.append(padding_end)
+        return max(boundaries, default=None)
+
     def last_safe_boundary(lower: int, upper: int) -> int | None:
+        if whole_tensors:
+            return last_tensor_boundary(lower, upper)
         best = None
         for start, end, block_bytes in tensors:
             first_block = max(0, (lower - start) // block_bytes + 1)
@@ -92,6 +113,11 @@ def host_registration_ranges(
     while total_size - start > max_chunk_bytes:
         end = last_safe_boundary(start, start + max_chunk_bytes)
         if end is None:
+            if whole_tensors:
+                raise ValueError(
+                    "Host tensors must each fit a page-aligned registration of at "
+                    f"most {max_chunk_bytes} bytes; reduce the host pool budget."
+                )
             raise ValueError(
                 "No block and page boundary fits the registration chunk limit."
             )

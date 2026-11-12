@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.platforms import current_platform
+from vllm.utils.host_memory import HOST_REGISTER_CHUNK_BYTES
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 if TYPE_CHECKING:
@@ -19,7 +20,16 @@ if TYPE_CHECKING:
 
 class HiSparseBackend:
     supports_shared_host_pool = False
+    # Whether local TP ranks order shared host-pool writes with exported IPC
+    # events. Without them the writer synchronizes and the ranks barrier.
+    supports_ipc_events = True
     stats_dtype = torch.uint64
+    # Upper bound on one host registration of the shared pool.
+    host_register_chunk_bytes = HOST_REGISTER_CHUNK_BYTES
+    # Whether every host layer tensor must lie inside a single registration.
+    register_whole_host_tensors = False
+    # Whether transfer descriptors must be pinned for asynchronous reads.
+    pin_dma_descriptors = False
 
     def check_available(self) -> None:
         raise NotImplementedError
@@ -71,6 +81,10 @@ class HiSparseBackend:
 
     def is_current_stream_capturing(self) -> bool:
         raise NotImplementedError
+
+    def host_dma_view(self, host_tensor: torch.Tensor) -> torch.Tensor:
+        """Return the tensor whose addresses transfer descriptors use."""
+        return host_tensor
 
     def swap_blocks_batch(
         self, src: torch.Tensor, dst: torch.Tensor, sizes: torch.Tensor
@@ -126,6 +140,47 @@ class CUDAHiSparseBackend(HiSparseBackend):
         from vllm import _custom_ops as ops
 
         ops.swap_blocks_batch(src, dst, sizes)
+
+
+class ROCmHiSparseBackend(CUDAHiSparseBackend):
+    """HIP shares the CUDA cache kernels; host transfers use mapped aliases."""
+
+    # Imported HIP IPC events fail after 32 record/wait cycles, so the shared
+    # host pool falls back to a writer synchronize plus a TP barrier.
+    supports_ipc_events = False
+    # Very large single HIP registrations can fail even when the pool fits RAM.
+    host_register_chunk_bytes = 64 << 30
+    # Each registration has its own device alias and the cache kernels resolve
+    # one alias per layer tensor, so a layer tensor cannot span registrations.
+    register_whole_host_tensors = True
+    # The copy kernel reads its descriptors asynchronously.
+    pin_dma_descriptors = True
+
+    def create_ipc_event(self) -> Any:
+        raise NotImplementedError("HiSparse does not use IPC events on ROCm.")
+
+    def export_event(self, event: Any) -> Any:
+        raise NotImplementedError("HiSparse does not use IPC events on ROCm.")
+
+    def import_event(self, device: torch.device, handle: Any) -> Any:
+        raise NotImplementedError("HiSparse does not use IPC events on ROCm.")
+
+    def host_dma_view(self, host_tensor: torch.Tensor) -> torch.Tensor:
+        # Registered HIP memory can have different CPU and device addresses.
+        row_bytes = host_tensor.stride(0) * host_tensor.element_size()
+        if host_tensor.data_ptr() % 8 or row_bytes % 8:
+            raise ValueError("HiSparse host rows must be 8-byte aligned on ROCm.")
+        return torch.ops._C.get_cuda_view_from_cpu_tensor(host_tensor, True)
+
+    def swap_blocks_batch(
+        self, src: torch.Tensor, dst: torch.Tensor, sizes: torch.Tensor
+    ) -> None:
+        from vllm.v1.kv_offload.cpu.swap_blocks_triton import swap_blocks_batch
+
+        # HIP lowers a batched copy to one queue entry per descriptor, and its
+        # blit path faults once enough of them are outstanding. One kernel
+        # launch copies every descriptor through the mapped host aliases.
+        swap_blocks_batch(src, dst, sizes, bytes_per_chunk=8192, force_kernel=True)
 
 
 def get_hisparse_backend() -> HiSparseBackend:

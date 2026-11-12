@@ -252,7 +252,8 @@ choose GPU LRU victim ──► copy pinned host row ──► hot physical row
 ```
 
 Device operations are selected by `Platform.get_hisparse_backend_cls()`. The base
-platform returns `None`; CUDA selects `CUDAHiSparseBackend` in `platforms/cuda.py`.
+platform returns `None`; CUDA selects `CUDAHiSparseBackend` in `platforms/cuda.py`
+and ROCm selects `ROCmHiSparseBackend` in `platforms/rocm.py`.
 Hardware plugins can provide a `HiSparseBackend` for host registration, cache
 operations, IPC events, capture queries, and transfers while reusing the common
 runtime and connector. HiSparse validates availability and cache formats before
@@ -260,7 +261,21 @@ allocation. Streams, ordinary events, current-stream queries, and synchronizatio
 use `torch.Stream`, `torch.Event`, and `torch.accelerator` directly. The backend
 provides IPC event creation/import/export only for shared host pools.
 Without HiSparse, sparse attention keeps its normal stream and event path.
-ROCm does not currently provide a HiSparse backend.
+
+ROCm shares the CUDA cache kernels, built for wave64. Its backend differs in
+host transfers and shared-pool ordering:
+
+- Registered HIP memory can have different CPU and device addresses, so
+  transfers address host rows through their device alias and run as one Triton
+  copy kernel rather than a batched copy, whose blit path faults once enough
+  copies are outstanding. Each host layer tensor lies inside one registration.
+- Imported HIP IPC events fail after 32 record/wait cycles, so local TP ranks
+  order shared host writes with a writer synchronize and a TP barrier each step.
+
+ROCm sparse MLA attends HiSparse rows only through int64-safe Triton kernels:
+physical row offsets in the shared multi-layer KV allocation can exceed the
+signed 32-bit addressing of the AITER assembly kernels. The packed `fp8_ds_mla`
+KV format is not supported on ROCm; use `auto`, `bfloat16`, or `fp8`.
 
 ## Main classes
 

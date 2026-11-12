@@ -65,8 +65,10 @@ class _SlotMappingStaging:
     source_index: int = 0
 
 
-def _allocate_dma_descriptors(size: int) -> _DMADescriptors:
-    src, dst, sizes = (torch.empty(size, dtype=torch.int64) for _ in range(3))
+def _allocate_dma_descriptors(size: int, *, pin_memory: bool) -> _DMADescriptors:
+    src, dst, sizes = (
+        torch.empty(size, dtype=torch.int64, pin_memory=pin_memory) for _ in range(3)
+    )
     return _DMADescriptors(
         src,
         dst,
@@ -159,7 +161,8 @@ def _create_hisparse_host_events(
     device: torch.device,
 ) -> tuple[torch.Event, torch.Event]:
     backend = get_hisparse_backend()
-    if shared_host_region is None:
+    if shared_host_region is None or not backend.supports_ipc_events:
+        # Without IPC events, start_step orders shared host writes explicitly.
         return torch.Event(), torch.Event()
 
     events: tuple[torch.Event, torch.Event] | None = None
@@ -184,6 +187,8 @@ def _create_hisparse_host_events(
 
 class HiSparseConnectorWorker:
     """Own HiSparse host/hot state and execute its worker-side transfers."""
+
+    host_dma_caches: tuple[torch.Tensor, ...] = ()
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
         self.backend = get_hisparse_backend()
@@ -378,6 +383,10 @@ class HiSparseConnectorWorker:
             assert cache.view is not None and cache.slot_mapping is not None
             resident_caches.append(cache.view.cache)
         self.host_caches = host_caches
+        # Host addresses that transfer descriptors name; may be device aliases.
+        self.host_dma_caches = tuple(
+            self.backend.host_dma_view(cache) for cache in host_caches
+        )
         self.resident_caches = tuple(resident_caches)
 
         for resident_cache, host_cache in zip(resident_caches, host_caches):
@@ -408,7 +417,13 @@ class HiSparseConnectorWorker:
         self.host_write_event = self.host_write_events[self._next_host_write_event]
         self._next_host_write_event ^= 1
         torch.accelerator.current_stream().wait_event(previous_host_write_event)
-        if self.shared_host_region is not None and not num_tokens:
+        if self.shared_host_region is not None and not self.backend.supports_ipc_events:
+            # The other ranks cannot wait on the writer's local event, so the
+            # writer drains its host writes before every rank proceeds.
+            if self.is_host_writer:
+                previous_host_write_event.synchronize()
+            get_tp_group().barrier()
+        elif self.shared_host_region is not None and not num_tokens:
             # Without a forward, no TP collective keeps rank 0 from recording
             # a shared event again before every rank has issued its wait.
             get_tp_group().barrier()
@@ -573,6 +588,10 @@ class HiSparseConnectorWorker:
             self._metrics_pending = True
         return stats
 
+    def _host_dma_cache(self, layer_index: int) -> torch.Tensor:
+        """Host layer cache as transfer descriptors address it."""
+        return (self.host_dma_caches or self.host_caches)[layer_index]
+
     def _release_completed_dma_descriptors(self) -> None:
         pending = self._pending_dma_descriptors
         while pending and pending[0][0].query():
@@ -583,7 +602,9 @@ class HiSparseConnectorWorker:
         for index, descriptors in enumerate(self._dma_free_descriptors):
             if descriptors.src.numel() >= size:
                 return self._dma_free_descriptors.pop(index)
-        return _allocate_dma_descriptors(size)
+        return _allocate_dma_descriptors(
+            size, pin_memory=self.backend.pin_dma_descriptors
+        )
 
     def _submit_dma_descriptors(
         self,
@@ -657,7 +678,7 @@ class HiSparseConnectorWorker:
                 raise RuntimeError("HiSparse row DMA source index is out of range.")
             source_rows = self._row_mirror_source_starts[:, source_index]
             source = self.resident_caches[layer_index]
-            destination = self.host_caches[layer_index]
+            destination = self._host_dma_cache(layer_index)
             row_bytes = source.shape[-1] * source.element_size()
             source_blocks, source_row_offsets = np.divmod(
                 source_rows, self.kernel_block_size
@@ -763,7 +784,7 @@ class HiSparseConnectorWorker:
             resident_blocks = resident_blocks_by_transfer[
                 :, cache.runtime.resident_source_index
             ]
-            source = self.host_caches[layer_index]
+            source = self._host_dma_cache(layer_index)
             destination = self.resident_caches[layer_index]
             if np.any(resident_blocks < 0) or np.any(
                 resident_blocks >= destination.shape[0]
@@ -824,7 +845,7 @@ class HiSparseConnectorWorker:
                 raise RuntimeError("HiSparse spill DMA source index is out of range.")
             source_blocks = source_blocks_by_transfer[:, source_index]
             source = self.resident_caches[layer_index]
-            destination = self.host_caches[layer_index]
+            destination = self._host_dma_cache(layer_index)
             if np.any(source_blocks < 0) or np.any(source_blocks >= source.shape[0]):
                 raise RuntimeError("HiSparse spill DMA source is out of range.")
             if np.any(destination_rows < 0) or np.any(
@@ -975,6 +996,8 @@ class HiSparseConnectorWorker:
             self._slot_mapping_staging.stream.synchronize()
         if self.dma_stream is not None:
             self.dma_stream.synchronize()
+        # Device aliases keep the host storage referenced; drop them first.
+        self.host_dma_caches = ()
         release_pinned_state(
             self.pinned_host_pools,
             self.shared_host_region,

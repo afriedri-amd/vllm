@@ -152,8 +152,8 @@ class Resolve:
 def test_resolve_cold_start_fills_slots_in_lru_order(top_k: int) -> None:
     """A cold resolve must take the oldest slots in order and rotate the LRU.
 
-    With every slot stale, miss ``i`` takes LRU position ``i``, so the new
-    order is a rotation by ``top_k``. This is exact *order*, not set
+    With every slot stale, miss `i` takes LRU position `i`, so the new
+    order is a rotation by `top_k`. This is exact *order*, not set
     membership: a compaction done 32-wide on a 64-wide wavefront leaves the
     set identical and only permutes it, which is the bug this file exists for.
     """
