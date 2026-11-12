@@ -189,6 +189,9 @@ class HiSparseConnectorWorker:
     """Own HiSparse host/hot state and execute its worker-side transfers."""
 
     host_dma_caches: tuple[torch.Tensor, ...] = ()
+    # Shared host-pool writes are ordered by a writer synchronize plus a TP
+    # barrier instead of exported events (backends without IPC events).
+    barrier_host_writes = False
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
         self.backend = get_hisparse_backend()
@@ -276,6 +279,9 @@ class HiSparseConnectorWorker:
         self.pinned_host_pools = pinned_host_pools
         self.shared_host_region = shared_host_region
         self.is_host_writer = is_host_writer
+        self.barrier_host_writes = (
+            shared_host_region is not None and not self.backend.supports_ipc_events
+        )
         self.dma_stream = torch.Stream(device=device) if self.is_host_writer else None
         self._slot_mapping_staging = None
         if self.is_host_writer:
@@ -417,7 +423,7 @@ class HiSparseConnectorWorker:
         self.host_write_event = self.host_write_events[self._next_host_write_event]
         self._next_host_write_event ^= 1
         torch.accelerator.current_stream().wait_event(previous_host_write_event)
-        if self.shared_host_region is not None and not self.backend.supports_ipc_events:
+        if self.barrier_host_writes:
             # The other ranks cannot wait on the writer's local event, so the
             # writer drains its host writes before every rank proceeds.
             if self.is_host_writer:

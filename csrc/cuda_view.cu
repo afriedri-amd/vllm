@@ -36,6 +36,10 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
     void* host_ptr = const_cast<void*>(cpu_tensor.mutable_data_ptr());
     void* device_ptr = nullptr;
     cudaError_t err = cudaHostGetDevicePointer(&device_ptr, host_ptr, 0);
+    if (err != cudaSuccess) {
+      // Clear the sticky error so it does not fail the next launch check.
+      (void)cudaGetLastError();
+    }
     STD_TORCH_CHECK(err == cudaSuccess, "cudaHostGetDevicePointer failed: ",
                     cudaGetErrorString(err));
 
@@ -46,6 +50,9 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
       void* end_ptr = nullptr;
       err = cudaHostGetDevicePointer(&end_ptr,
                                      static_cast<char*>(host_ptr) + last, 0);
+      if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+      }
       STD_TORCH_CHECK(
           err == cudaSuccess && static_cast<char*>(end_ptr) ==
                                     static_cast<char*>(device_ptr) + last,

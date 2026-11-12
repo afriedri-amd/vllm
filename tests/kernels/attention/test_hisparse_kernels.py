@@ -283,8 +283,6 @@ def ref_gather_plan(
     global_indices: np.ndarray,
     hot_indices: np.ndarray,
     miss_mask: np.ndarray,
-    request_state_indices: np.ndarray,
-    attention_indices: np.ndarray,
     hot_block_size: int,
     hot_block_stride: int,
 ) -> None:
@@ -293,16 +291,10 @@ def ref_gather_plan(
     hot_rows = (hot_cache.size // hot_block_stride) * hot_block_size
 
     for row in range(num_rows):
-        is_padding = int(request_state_indices[row]) < 0
         for col in range(top_k):
-            dst = int(hot_indices[row, col])
-            attention_indices[row, col] = (
-                -1
-                if is_padding or dst < 0
-                else (dst // hot_block_size) * hot_block_size + dst % hot_block_size
-            )
-            if is_padding or int(miss_mask[row, col]) == 0:
+            if int(miss_mask[row, col]) == 0:
                 continue
+            dst = int(hot_indices[row, col])
             g = int(global_indices[row, col])
             if g < 0 or dst < 0 or dst >= hot_rows:
                 continue
@@ -358,18 +350,14 @@ def test_gather_plan_matches_reference(top_k: int, row_bytes: int) -> None:
     )
     hot_indices = _distinct_hot_indices(rng, num_rows, top_k, hot_rows)
     miss_mask = rng.integers(0, 2, size=(num_rows, top_k), dtype=np.int32)
-    state_indices = np.array([0, -1], dtype=np.int32)
 
     want_hot = hot.copy()
-    want_attn = np.full((num_rows, top_k), POISON, dtype=np.int32)
     ref_gather_plan(
         host,
         want_hot,
         global_indices,
         hot_indices,
         miss_mask,
-        state_indices,
-        want_attn,
         hot_block_size,
         hot_block_size * row_bytes,
     )
@@ -377,21 +365,16 @@ def test_gather_plan_matches_reference(top_k: int, row_bytes: int) -> None:
     d_hot = torch.from_numpy(
         hot.copy().reshape(hot_num_blocks, hot_block_size, row_bytes)
     ).to(DEVICE)
-    d_attn = _dev(np.full((num_rows, top_k), POISON, np.int32))
     torch.ops._C_cache_ops.hisparse_gather_plan(
         _pinned(torch.from_numpy(host.copy())),
         d_hot,
         _dev(global_indices),
         _dev(hot_indices),
         _dev(miss_mask),
-        _dev(state_indices),
-        d_attn,
-        hot_block_size,
     )
     torch.accelerator.synchronize()
 
     np.testing.assert_array_equal(d_hot.cpu().numpy().reshape(-1), want_hot)
-    np.testing.assert_array_equal(d_attn.cpu().numpy(), want_attn)
 
 
 @requires_hisparse_ops
@@ -467,11 +450,15 @@ def test_invalidate_written_slots_clears_every_copy(region_stride: int) -> None:
         want[state_idx][want[state_idx] == slot] = -1
 
     d_dgi = _dev(dgi)
+    # The op takes a device table of per-group table addresses.
+    group_table = torch.tensor([d_dgi.data_ptr()], dtype=torch.int64, device=DEVICE)
     torch.ops._C_cache_ops.hisparse_invalidate_written_slots(
-        d_dgi,
+        group_table,
         _dev(state_indices),
         _dev(req_id_per_token),
         _dev(written_slots, torch.int64),
+        num_states,
+        region_stride,
     )
     torch.accelerator.synchronize()
 

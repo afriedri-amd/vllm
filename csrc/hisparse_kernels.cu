@@ -1119,8 +1119,6 @@ void hisparse_resolve_residency(
                   "hot-cache rows must be contiguous");
   const int64_t hot_block_size = hot_cache.size(1);
   const int64_t hot_rows = hot_cache.size(0) * hot_block_size;
-  const int64_t hot_block_stride =
-      hot_cache.stride(0) * hot_cache.element_size();
   const int64_t host_rows = check_2d_rows(host_cache, "host_cache", row_bytes);
   const auto launch_rows = static_cast<int32_t>(num_rows);
   const auto top_k = static_cast<int32_t>(global_indices.size(1));
@@ -1350,8 +1348,10 @@ void hisparse_resolve_residency(
       configured.resize(device_index + 1, 0);
     }
     if (configured[device_index] < smem_bytes) {
+      // HIP has no templated overload; the C entry point takes const void*.
       const cudaError_t attribute_error = cudaFuncSetAttribute(
-          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+          reinterpret_cast<const void*>(kernel),
+          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
       STD_TORCH_CHECK(attribute_error == cudaSuccess,
                       "failed to configure HiSparse swap-in shared memory: ",
                       cudaGetErrorString(attribute_error));

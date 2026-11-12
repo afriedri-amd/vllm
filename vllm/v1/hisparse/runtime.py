@@ -18,7 +18,10 @@ from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context, in_piecewise_cudagraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils.host_memory import host_registration_ranges
+from vllm.utils.host_memory import (
+    HOST_REGISTER_CHUNK_BYTES,
+    host_registration_ranges,
+)
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -345,14 +348,19 @@ def allocate_hisparse_host_pools(
         num_segments=REGION_SEGMENTS,
     )
     backend = get_hisparse_backend()
+    # Only backends that constrain registration override the default split.
+    registration_kwargs: dict[str, Any] = {}
+    if backend.host_register_chunk_bytes != HOST_REGISTER_CHUNK_BYTES:
+        registration_kwargs["max_chunk_bytes"] = backend.host_register_chunk_bytes
+    if backend.register_whole_host_tensors:
+        registration_kwargs["whole_tensors"] = True
     pinned: list[torch.Tensor] = []
     try:
         for start, end in host_registration_ranges(
             tensor_sizes,
             num_blocks,
             num_blocks * host_block_stride,
-            backend.host_register_chunk_bytes,
-            whole_tensors=backend.register_whole_host_tensors,
+            **registration_kwargs,
         ):
             tensor = region.base_tensor[start:end]
             pin_tensor(tensor)

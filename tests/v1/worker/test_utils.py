@@ -315,6 +315,10 @@ def test_hisparse_shares_host_pool_only_for_local_tp(monkeypatch):
 
 @pytest.mark.skip_global_cleanup
 def test_hisparse_shared_host_pool_uses_one_replicated_mmap(monkeypatch):
+    # Asserts the default registration split; other backends may constrain it.
+    monkeypatch.setattr(
+        hisparse_runtime_module, "get_hisparse_backend", CUDAHiSparseBackend
+    )
     page = mmap.PAGESIZE
     tp_group = MagicMock(rank_in_group=1, world_size=2)
     monkeypatch.setattr(hisparse_runtime_module, "get_tp_group", lambda: tp_group)

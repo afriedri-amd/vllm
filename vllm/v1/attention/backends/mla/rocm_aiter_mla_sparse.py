@@ -1221,10 +1221,14 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
         )
         store_mxfp4_mla(kv_c_normed, slot_mapping.flatten(), kv_cache)
 
+    def _uses_hisparse(self) -> bool:
+        # index_group is bound by the sparse MLA layer after construction.
+        return isinstance(getattr(self, "index_group", None), HiSparseMLAIndexGroup)
+
     def record_logical_topk_ready(self) -> None:
         # Only HiSparse consumes the logical top-k event; other index groups on
         # this backend share the buffer via SharedTopkIndicesBuffer alone.
-        if isinstance(self.index_group, HiSparseMLAIndexGroup):
+        if self._uses_hisparse():
             super().record_logical_topk_ready()
 
     def _forward_mqa_kernel(
@@ -1598,7 +1602,7 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
 
         num_actual_toks = q.shape[0]
 
-        if isinstance(self.index_group, HiSparseMLAIndexGroup):
+        if self._uses_hisparse():
             if fp8_attention:
                 kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
                     current_platform.fp8_dtype()
