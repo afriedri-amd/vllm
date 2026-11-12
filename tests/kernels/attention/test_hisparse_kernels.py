@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -107,10 +109,11 @@ class Resolve:
         n, k = self.num_rows, self.top_k
         outs = {
             name: _dev(np.full((n, k), POISON, np.int32))
-            for name in ("hot", "attn", "miss", "resolved", "swap_host", "swap_dev")
+            for name in ("hot", "attn", "swap_host", "swap_dev")
         }
         outs["valid"] = _dev(np.full(n, POISON, np.int32))
         outs["swap_counts"] = _dev(np.full(n, POISON, np.int32))
+        stats = torch.zeros(2, dtype=torch.uint64, device=DEVICE)
 
         torch.ops._C_cache_ops.hisparse_resolve_residency(
             _pinned(torch.zeros(self.host_rows, 16, dtype=torch.uint8)),
@@ -127,26 +130,21 @@ class Resolve:
             self.dgi,
             self.lru,
             _dev(self.state_indices),
-            self.hot_size,
+            self.hot_size,  # region_stride
             self.top_k,  # max_union_rows: one row per request here
-            outs["miss"],
-            None,  # stats
-            outs["attn"],
-            self.HOT_BLOCK_SIZE,  # attention_block_stride
-            None,  # request_ids
-            None,  # source_block_table
-            0,
-            outs["resolved"],
-            outs["valid"],
-            outs["swap_host"],
-            outs["swap_dev"],
-            outs["swap_counts"],
-            None,  # resident_block_table
-            0,
-            0,
+            stats=stats,
+            attention_indices=outs["attn"],
+            attention_block_stride=self.HOT_BLOCK_SIZE,
+            valid_counts=outs["valid"],
+            swap_host_physical_rows=outs["swap_host"],
+            swap_device_physical_rows=outs["swap_dev"],
+            swap_counts=outs["swap_counts"],
         )
         torch.accelerator.synchronize()
-        return {k_: v.cpu().numpy() for k_, v in outs.items()}
+        result = {k_: v.cpu().numpy() for k_, v in outs.items()}
+        hits, misses = stats.cpu().tolist()
+        result["hits"], result["misses"] = np.int64(hits), np.int64(misses)
+        return result
 
 
 @requires_hisparse_ops
@@ -168,10 +166,7 @@ def test_resolve_cold_start_fills_slots_in_lru_order(top_k: int) -> None:
     )
     np.testing.assert_array_equal(out["hot"], want_hot)
     np.testing.assert_array_equal(out["attn"], want_hot)
-    np.testing.assert_array_equal(out["resolved"], case.global_indices)
-    np.testing.assert_array_equal(
-        out["miss"], np.ones((case.num_rows, top_k), np.int32)
-    )
+    assert out["misses"] == case.num_rows * top_k
     np.testing.assert_array_equal(out["valid"], np.full(case.num_rows, top_k, np.int32))
     np.testing.assert_array_equal(
         out["swap_counts"], np.full(case.num_rows, top_k, np.int32)
@@ -205,9 +200,7 @@ def test_resolve_warm_replay_hits_without_touching_state(top_k: int) -> None:
     np.testing.assert_array_equal(
         second["swap_counts"], np.zeros(case.num_rows, np.int32)
     )
-    np.testing.assert_array_equal(
-        second["miss"], np.zeros((case.num_rows, top_k), np.int32)
-    )
+    assert second["misses"] == 0
     np.testing.assert_array_equal(case.lru.cpu().numpy(), lru_after_cold)
     np.testing.assert_array_equal(case.dgi.cpu().numpy(), dgi_after_cold)
 
@@ -224,7 +217,6 @@ def test_resolve_padding_rows_publish_minus_one() -> None:
     for row in (1, 3):
         assert (out["hot"][row] == -1).all()
         assert (out["attn"][row] == -1).all()
-        assert (out["resolved"][row] == -1).all()
         assert out["valid"][row] == 0
         assert out["swap_counts"][row] == 0
         np.testing.assert_array_equal(case.lru.cpu().numpy()[row], lru_before[row])
@@ -241,9 +233,10 @@ def test_resolve_out_of_range_lru_slot_degrades_to_remiss() -> None:
 
     out = case.step()
 
-    assert (out["hot"][0] == -1).any()
-    for col in np.where(out["hot"][0] == -1)[0]:
-        assert out["miss"][0, col] == 0, "an invalid entry must not be a miss"
+    # The bad slot is treated as no-hit, so its row re-misses into a valid slot
+    # instead of being read out of bounds.
+    hot = out["hot"][0]
+    assert ((hot == -1) | ((hot >= 0) & (hot < case.hot_num_blocks * 8))).all()
 
 
 @requires_hisparse_ops
@@ -485,6 +478,50 @@ def test_invalidate_written_slots_clears_every_copy(region_stride: int) -> None:
     np.testing.assert_array_equal(d_dgi.cpu().numpy(), want)
 
 
+def _ragged_to_dense(indices: torch.Tensor, indptr: torch.Tensor) -> torch.Tensor:
+    """-1-padded [rows, width] top-k, the form HiSparse hands the kernel hook."""
+    bounds = indptr.tolist()
+    width = max(1, max(end - start for start, end in zip(bounds, bounds[1:])))
+    dense = torch.full(
+        (len(bounds) - 1, width), -1, dtype=torch.int32, device=indices.device
+    )
+    for row, (start, end) in enumerate(zip(bounds, bounds[1:])):
+        dense[row, : end - start] = indices[start:end]
+    return dense
+
+
+def _rocm_hisparse_impl(kv_cache_dtype: str, sinks: torch.Tensor | None = None):
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
+        ROCMAiterMLASparseImpl,
+    )
+
+    impl = object.__new__(ROCMAiterMLASparseImpl)
+    impl.num_heads = 16
+    impl.kv_lora_rank = 512
+    impl.qk_rope_head_dim = 64
+    impl.kv_cache_dtype = kv_cache_dtype
+    impl.scale = 576**-0.5
+    impl.sinks = sinks
+    impl.use_aiter_sparse_mla = False
+    impl._attn_out_dtype = torch.bfloat16
+    return impl
+
+
+def _hisparse_kernel_forward(impl, layer, q, kv, dense_topk) -> torch.Tensor:
+    """Run the ROCm HiSparse attention hook on [rows, 1, 576] KV rows."""
+    output, lse = impl._forward_mqa_kernel(
+        q,
+        kv,
+        dense_topk,
+        (dense_topk >= 0).sum(dim=1, dtype=torch.int32),
+        layer=layer,
+        block_size=1,
+        is_decode=True,
+    )
+    assert lse is None
+    return output
+
+
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm sparse attention")
 @pytest.mark.parametrize("backend", [False, True])
 def test_hisparse_attention_large_slab_row_offsets(backend):
@@ -506,44 +543,29 @@ def test_hisparse_attention_large_slab_row_offsets(backend):
     )
     kv[indices.long(), 0] = selected
     indptr = torch.tensor([0, 2, 3], device=DEVICE, dtype=torch.int32)
-    output = torch.empty((2, 16, 512), device=DEVICE, dtype=q.dtype)
     scale = width**-0.5
-    rocm_sparse_attn_prefill(
-        q=q,
-        kv=kv,
-        indices=None,
-        topk_length=None,
-        scale=scale,
-        head_dim=width,
-        nope_head_dim=512,
-        rope_head_dim=64,
-        attn_sink=None,
-        output=output,
-        ragged_indices=indices,
-        ragged_indptr=indptr,
-        allow_aiter_opus=False,
-    )
     if backend:
-        from types import SimpleNamespace
-
-        from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
-            ROCMAiterMLASparseImpl,
+        impl = _rocm_hisparse_impl("auto")
+        output = _hisparse_kernel_forward(
+            impl, SimpleNamespace(), q, kv, _ragged_to_dense(indices, indptr)
         )
-
-        impl = object.__new__(ROCMAiterMLASparseImpl)
-        impl.num_heads = 16
-        impl.kv_lora_rank = 512
-        impl.qk_rope_head_dim = 64
-        impl.kv_cache_dtype = "auto"
-        impl.scale = scale
-        impl.sinks = None
-        impl.use_hisparse_triton_attn = True
-        metadata = SimpleNamespace(
-            paged_kv_indices=indices,
-            paged_kv_indptr=indptr,
-            attn_out_dtype=q.dtype,
+    else:
+        output = torch.empty((2, 16, 512), device=DEVICE, dtype=q.dtype)
+        rocm_sparse_attn_prefill(
+            q=q,
+            kv=kv,
+            indices=None,
+            topk_length=None,
+            scale=scale,
+            head_dim=width,
+            nope_head_dim=512,
+            rope_head_dim=64,
+            attn_sink=None,
+            output=output,
+            ragged_indices=indices,
+            ragged_indptr=indptr,
+            allow_aiter_prefill=False,
         )
-        output, _ = impl._forward_mla(SimpleNamespace(), q, kv, metadata)
     scores = q[0].float() @ selected[:2].float().T * scale
     expected_first = scores.softmax(-1) @ selected[:2, :512].float()
     expected = torch.stack((expected_first, selected[2, :512].float().expand(16, -1)))
@@ -582,12 +604,6 @@ def test_hisparse_gather_registered_host_device_alias():
 @pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize("selected_rows", [3, 2048])
 def test_hisparse_fp8_attention_applies_scales(scales, capture, selected_rows):
-    from types import SimpleNamespace
-
-    from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
-        ROCMAiterMLASparseImpl,
-    )
-
     generator = torch.Generator(device=DEVICE).manual_seed(91)
     q_scale, kv_scale = scales
     q = (torch.randn((3, 16, 576), generator=generator, device=DEVICE) / q_scale).to(
@@ -608,28 +624,17 @@ def test_hisparse_fp8_attention_applies_scales(scales, capture, selected_rows):
         dtype=torch.int32,
         device=DEVICE,
     )
-    impl = object.__new__(ROCMAiterMLASparseImpl)
-    impl.num_heads = 16
-    impl.kv_lora_rank = 512
-    impl.qk_rope_head_dim = 64
-    impl.kv_cache_dtype = "fp8"
-    impl.scale = 576**-0.5
-    impl.sinks = None
-    impl.use_hisparse_triton_attn = True
-    metadata = SimpleNamespace(
-        paged_kv_indices=indices,
-        paged_kv_indptr=indptr,
-        attn_out_dtype=torch.bfloat16,
-    )
+    dense = _ragged_to_dense(indices, indptr)
+    impl = _rocm_hisparse_impl("fp8")
     layer = SimpleNamespace(
         _q_scale=torch.tensor(q_scale, device=DEVICE),
         _k_scale=torch.tensor(kv_scale, device=DEVICE),
     )
-    output, _ = impl._forward_mla(layer, q, kv, metadata)
+    output = _hisparse_kernel_forward(impl, layer, q, kv, dense)
     if capture:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            output, _ = impl._forward_mla(layer, q, kv, metadata)
+            output = _hisparse_kernel_forward(impl, layer, q, kv, dense)
         graph.replay()
     q_reference = q.float() * q_scale
     kv_reference = kv.float()[:, 0] * kv_scale
@@ -642,9 +647,7 @@ def test_hisparse_fp8_attention_applies_scales(scales, capture, selected_rows):
             torch.zeros((16, 512), device=DEVICE),
         )
     )
-    # AITER uses FP8 for the PV dot as well: probabilities round to E4M3.
-    # Bound the resulting error against the dequantized FP32 reference;
-    # non-unit scales still detect missing or double-applied quantization scales.
+    # Non-unit scales detect missing or double-applied quantization scales.
     torch.testing.assert_close(output.float(), expected, atol=0.06, rtol=0.03)
     assert (output[2] == 0).all()
 
@@ -653,13 +656,7 @@ def test_hisparse_fp8_attention_applies_scales(scales, capture, selected_rows):
 @pytest.mark.parametrize("with_sink", [False, True])
 @pytest.mark.parametrize("capture", [False, True])
 def test_hisparse_bf16_attention_ragged_rows(with_sink, capture):
-    """The backend preserves empty, short and full selected rows with graph replay."""
-    from types import SimpleNamespace
-
-    from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
-        ROCMAiterMLASparseImpl,
-    )
-
+    """Empty, short and full selected rows survive graph replay."""
     generator = torch.Generator(device=DEVICE).manual_seed(62)
     q = torch.randn(
         (3, 16, 576), generator=generator, device=DEVICE, dtype=torch.bfloat16
@@ -667,38 +664,25 @@ def test_hisparse_bf16_attention_ragged_rows(with_sink, capture):
     kv = torch.randn(
         (2048, 1, 576), generator=generator, device=DEVICE, dtype=torch.bfloat16
     )
-    indices = torch.cat(
-        (torch.tensor([17], device=DEVICE), torch.arange(2048, device=DEVICE))
-    ).to(torch.int32)
-    indptr = torch.tensor([0, 0, 1, 2049], device=DEVICE, dtype=torch.int32)
+    dense = torch.full((3, 2048), -1, dtype=torch.int32, device=DEVICE)
+    dense[1, 0] = 17
+    dense[2] = torch.arange(2048, dtype=torch.int32, device=DEVICE)
     sink = torch.linspace(-1, 1, 16, device=DEVICE) if with_sink else None
-    impl = object.__new__(ROCMAiterMLASparseImpl)
-    impl.num_heads = 16
-    impl.kv_lora_rank = 512
-    impl.qk_rope_head_dim = 64
-    impl.kv_cache_dtype = "auto"
-    impl.scale = 576**-0.5
-    impl.sinks = sink
-    impl.use_hisparse_triton_attn = True
-    metadata = SimpleNamespace(
-        paged_kv_indices=indices,
-        paged_kv_indptr=indptr,
-        attn_out_dtype=q.dtype,
-    )
+    impl = _rocm_hisparse_impl("auto", sink)
     layer = SimpleNamespace()
-    output, _ = impl._forward_mla(layer, q, kv, metadata)
+    output = _hisparse_kernel_forward(impl, layer, q, kv, dense)
     if capture:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            output, _ = impl._forward_mla(layer, q, kv, metadata)
+            output = _hisparse_kernel_forward(impl, layer, q, kv, dense)
         graph.replay()
 
-    def reference(boundaries):
+    def reference() -> torch.Tensor:
         expected = torch.zeros_like(output, dtype=torch.float32)
-        for row, (start, end) in enumerate(
-            zip(boundaries[:-1], boundaries[1:], strict=True)
-        ):
-            selected = indices[start:end].long()
+        for row in range(dense.shape[0]):
+            selected = dense[row][dense[row] >= 0].long()
+            if selected.numel() == 0:
+                continue
             scores = q[row].float() @ kv[selected, 0].float().T * impl.scale
             if sink is not None:
                 scores = torch.cat((scores, sink[:, None]), dim=-1)
@@ -706,22 +690,18 @@ def test_hisparse_bf16_attention_ragged_rows(with_sink, capture):
             expected[row] = weights @ kv[selected, 0, :512].float()
         return expected
 
-    torch.testing.assert_close(
-        output.float(), reference([0, 0, 1, 2049]), atol=0.03, rtol=0.03
-    )
+    torch.testing.assert_close(output.float(), reference(), atol=0.03, rtol=0.03)
     if capture:
         # Move the empty row without changing any captured tensor addresses.
-        boundaries = [0, 1, 1, 2049]
-        indptr.copy_(torch.tensor(boundaries, device=DEVICE, dtype=indptr.dtype))
+        dense[0, 0] = 17
+        dense[1, 0] = -1
         graph.replay()
-        torch.testing.assert_close(
-            output.float(), reference(boundaries), atol=0.03, rtol=0.03
-        )
+        torch.testing.assert_close(output.float(), reference(), atol=0.03, rtol=0.03)
 
 
 @requires_hisparse_ops
-def test_resolve_global_hash_values_survive_padded_graph_replay():
-    """Two request-0 runs must not share scratch, including graph padding.
+def test_resolve_mtp_union_survives_padded_graph_replay():
+    """Two request-0 runs must not share resolver state, including graph padding.
 
     Four disjoint top-k rows model MTP3 at GLM's real union size. Replaying
     changing selections checks cold loads, reuse, eviction and stale scratch.
@@ -738,7 +718,6 @@ def test_resolve_global_hash_values_survive_padded_graph_replay():
     ).repeat(2, 1)
     indices = torch.full((n, k), -1, dtype=torch.int32, device=DEVICE)
     out = torch.empty_like(indices)
-    scratch = torch.empty((n, union_size + 1), dtype=torch.int32, device=DEVICE)
     counts = torch.empty(n, dtype=torch.int32, device=DEVICE)
     swap_host, swap_dev = torch.empty_like(indices), torch.empty_like(indices)
 
@@ -760,10 +739,14 @@ def test_resolve_global_hash_values_survive_padded_graph_replay():
             swap_host_physical_rows=swap_host,
             swap_device_physical_rows=swap_dev,
             swap_counts=counts,
-            hash_values_scratch=scratch,
         )
 
-    resolve()
+    try:
+        resolve()
+    except RuntimeError as error:
+        if "shared memory" not in str(error):
+            raise
+        pytest.skip(f"device shared memory is too small for this union: {error}")
     torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

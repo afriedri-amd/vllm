@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton kernel + tuned constants for the ``swap_blocks_batch`` fast path."""
+"""Triton kernel + tuned constants for the `swap_blocks_batch` fast path."""
 
 from __future__ import annotations
 
@@ -57,10 +57,10 @@ def swap_blocks_batch(
 ) -> None:
     """Copy GPU-addressable buffers, including explicitly mapped host storage.
 
-    ``force_kernel`` avoids one runtime copy submission per descriptor on
-    platforms where those submissions can fill a hardware queue.
-    Addresses and sizes must be eight-byte aligned. The caller retains the
-    host descriptors and underlying storage until this stream completes.
+    `force_kernel` avoids one runtime copy submission per descriptor on
+    platforms where those submissions can fill a hardware queue. Addresses and
+    sizes must be eight-byte aligned. The caller retains the host descriptors
+    and underlying storage until this stream completes.
     """
     n = src_addrs.numel()
     # Too few descriptors to amortize Triton's launch cost.

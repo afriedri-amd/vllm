@@ -206,6 +206,36 @@ coordinates. Request identity and logical page state remain in the scheduler.
 
 ## Hot lookup and LRU
 
+### Speculative decode group prefetch
+
+HiSparse prefetches historical KV for layers sharing an indexer during pure
+decode batches, including multi-token verification with speculative decoding
+such as MTP. It uses the existing speculative-decoding configuration and swap
+capacity; no additional switch or backend capability flag is required.
+
+The index-producing layer resolves the current top-k once and queues each
+layer's missing rows on the group's copy stream. Each layer waits on its own
+completion event before consuming those rows, allowing later layers' copies to
+overlap earlier layers' computation. Prefill and mixed prefill/decode batches
+retain per-layer staging.
+
+This prefetch eligibility is separate from single-token resident-write and host
+mirror policy. Current verification tokens remain in resident KV, are excluded
+from the historical host-row swap plan, and are written by each layer before
+its attention runs. Prefetching does not publish rejected draft tokens as
+durable host KV. The benefit depends on host misses, shared-index group size,
+and how much copy work can overlap computation.
+
+The CUDA compact gather uses at most 64 thread blocks per launch. Workers loop
+over additional rows when verification expands the batch beyond that limit;
+the existing column parallelism is retained for smaller batches. This bounds
+copy-kernel occupancy while later layers are prefetched, without reading miss
+counts back to the CPU or launching a separate compaction kernel. Actual copy
+bandwidth and end-to-end latency must be measured together, since bounding the
+grid can trade peak copy throughput for compute overlap.
+
+### Row resolution
+
 The NVIDIA CUDA path keeps replacement entirely on the accelerator:
 
 ```text
@@ -221,28 +251,16 @@ hot row? ──────── yes ──► existing hot physical row + upda
 choose GPU LRU victim ──► copy pinned host row ──► hot physical row
 ```
 
-ROCm uses the HIP cache operations and the ROCm AITER sparse-MLA backend.
-The attention calculation uses the Triton ragged kernel because physical row
-offsets in the shared multi-layer KV allocation can exceed the signed 32-bit
-addressing range of the AITER assembly path. The packed `fp8_ds_mla` KV format
-is not supported on ROCm; use `auto`, `bfloat16`, or `fp8`.
-
-On CDNA, the residency resolver moves per-token scratch to reusable device-global
-storage when it would exceed the 64 KiB LDS budget. The remaining shared-memory
-state must still fit that budget; configurations exceeding it are rejected.
-Kernel tests cover `index_topk=2048` with three speculative tokens, but this
-coverage alone does not establish full-model support for every configuration.
-
-Local tensor-parallel workers share the host pool. ROCm orders host writes with
-a writer event synchronization and a TP barrier, rather than reusing imported
-HIP IPC events. This adds a per-step synchronization cost. Registered host
-memory is accessed through its HIP device alias, which can differ from its CPU
-address.
-
-When using a ROCm AITER version affected by the FP8 MoE scale overread reported
-in [ROCm/aiter#5764](https://github.com/ROCm/aiter/pull/5764), select
-`--kernel-config '{"moe_backend":"triton"}'`. This workaround is independent
-of the sparse cache operations.
+Device operations are selected by `Platform.get_hisparse_backend_cls()`. The base
+platform returns `None`; CUDA selects `CUDAHiSparseBackend` in `platforms/cuda.py`.
+Hardware plugins can provide a `HiSparseBackend` for host registration, cache
+operations, IPC events, capture queries, and transfers while reusing the common
+runtime and connector. HiSparse validates availability and cache formats before
+allocation. Streams, ordinary events, current-stream queries, and synchronization
+use `torch.Stream`, `torch.Event`, and `torch.accelerator` directly. The backend
+provides IPC event creation/import/export only for shared host pools.
+Without HiSparse, sparse attention keeps its normal stream and event path.
+ROCm does not currently provide a HiSparse backend.
 
 ## Main classes
 
@@ -279,6 +297,5 @@ of the sparse cache operations.
 The command/result and attention-layer boundaries can be shared. The host
 allocator, copy implementation, hot layout, and replacement policy should stay
 platform-specific. NVIDIA uses the current accelerator LRU and fused host/hot
-kernel. ROCm uses HIP host registration, device aliases, and a shared host-pool
-worker with explicit TP synchronization. Other accelerator backends can implement
-their own worker without forcing NVIDIA's policy into the shared boundary.
+kernel. Other accelerators can implement `HiSparseBackend` and return its class
+path from their platform override without changing the shared control flow.

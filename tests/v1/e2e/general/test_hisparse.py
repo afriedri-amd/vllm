@@ -22,6 +22,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine.core_client import InprocClient
 from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
 
 MODEL = "deepseek-ai/DeepSeek-V3.2"
@@ -48,9 +50,10 @@ def _shrink_config(config):
 
 def _num_hisparse_spills(runner: VllmRunner) -> int:
     client = runner.llm.llm_engine.engine_core
-    coordinator = get_hisparse_coordinator(
-        client.engine_core.scheduler.kv_cache_manager
-    )
+    assert isinstance(client, InprocClient)
+    scheduler = client.engine_core.scheduler
+    assert isinstance(scheduler, Scheduler)
+    coordinator = get_hisparse_coordinator(scheduler.kv_cache_manager)
     return coordinator.next_spill_id
 
 
@@ -65,7 +68,9 @@ def _offload_load_bytes() -> float:
 
 
 def _get_hisparse_worker(runner: VllmRunner) -> HiSparseConnectorWorker:
-    engine_core = runner.llm.llm_engine.engine_core.engine_core
+    client = runner.llm.llm_engine.engine_core
+    assert isinstance(client, InprocClient)
+    engine_core = client.engine_core
     model_runner = engine_core.model_executor.driver_worker.worker.model_runner
     connector = model_runner.kv_connector.kv_connector
     if isinstance(connector, MultiConnector):
@@ -80,19 +85,24 @@ def _get_hisparse_worker(runner: VllmRunner) -> HiSparseConnectorWorker:
 
 
 @pytest.mark.skipif(
-    not (current_platform.is_cuda() or current_platform.is_rocm()),
-    reason="HiSparse requires NVIDIA CUDA or AMD ROCm",
+    current_platform.get_hisparse_backend_cls() is None,
+    reason="HiSparse is not supported on this platform",
 )
 @pytest.mark.parametrize(
-    "offloading_spec",
-    [None, "CPUOffloadingSpec", "TieringOffloadingSpec"],
-    ids=["standalone", "offload", "tiering"],
+    "with_offloading,attention_backend",
+    [
+        pytest.param(False, None, id="standalone"),
+        pytest.param(True, None, id="offload"),
+        # Offloading does not touch the attention kernels: FA4 runs standalone.
+        pytest.param(False, "FLASH_ATTN_MLA_SPARSE_FA4", id="standalone-fa4"),
+    ],
 )
 @fork_new_process_for_each_test
 def test_hisparse_spill_and_prefix_restore(
     monkeypatch: pytest.MonkeyPatch,
     vllm_runner: type[VllmRunner],
-    offloading_spec: str | None,
+    with_offloading: bool,
+    attention_backend: str | None,
 ):
     """Spilled prefixes restore and FULL-graph decode writes reach host KV.
 
@@ -101,10 +111,11 @@ def test_hisparse_spill_and_prefix_restore(
     MTP layers write after the target forward; their rows used to be mirrored
     before the drafter wrote them, so the drafter later read stale host rows.
     """
-    if current_platform.is_cuda():
-        capability = current_platform.get_device_capability()
-        if capability is None or capability.major < 9:
-            pytest.skip("Sparse MLA requires Hopper or newer")
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major < 9:
+        pytest.skip("Sparse MLA requires Hopper or newer")
+    if attention_backend and not current_platform.is_device_capability_family(100):
+        pytest.skip("FA4 sparse MLA requires SM 10.x")
 
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     monkeypatch.setenv("VLLM_DEEP_GEMM_WARMUP", "skip")
@@ -120,7 +131,7 @@ def test_hisparse_spill_and_prefix_restore(
         "kv_connector_extra_config": {"host_pool_gib": 1},
     }
     kv_transfer_config = KVTransferConfig(**hisparse_connector)
-    if offloading_spec:
+    if with_offloading:
         kv_transfer_config = KVTransferConfig(
             kv_connector="MultiConnector",
             kv_role="kv_both",
@@ -130,10 +141,7 @@ def test_hisparse_spill_and_prefix_restore(
                     {
                         "kv_connector": "OffloadingConnector",
                         "kv_role": "kv_both",
-                        "kv_connector_extra_config": {
-                            "cpu_bytes_to_use": 1 << 30,
-                            "spec_name": offloading_spec,
-                        },
+                        "kv_connector_extra_config": {"cpu_bytes_to_use": 1 << 30},
                     },
                 ]
             },
@@ -142,8 +150,6 @@ def test_hisparse_spill_and_prefix_restore(
     with vllm_runner(
         MODEL,
         load_format="dummy",
-        # Avoid the independent AITER FP8 MoE scale overread (ROCm/aiter#5764).
-        kernel_config={"moe_backend": "triton"} if current_platform.is_rocm() else None,
         hf_overrides=_shrink_config,
         attention_config=AttentionConfig(
             hisparse_config=HiSparseConfig(
@@ -151,6 +157,7 @@ def test_hisparse_spill_and_prefix_restore(
             )
         ),
         kv_transfer_config=kv_transfer_config,
+        attention_backend=attention_backend,
         block_size=64,
         max_model_len=320,
         max_num_batched_tokens=1024,
@@ -167,6 +174,7 @@ def test_hisparse_spill_and_prefix_restore(
     ) as runner:
         worker = _get_hisparse_worker(runner)
         engine_core = runner.llm.llm_engine.engine_core.engine_core
+        assert engine_core.vllm_config.num_hash_lookahead_tokens > 0
         model_runner = engine_core.model_executor.driver_worker.worker.model_runner
         full_graph_calls = 0
         full_replay_pending = False
@@ -256,13 +264,95 @@ def test_hisparse_spill_and_prefix_restore(
         runner.generate_greedy([[42]], max_tokens=1)
 
         assert actual == expected
-        if offloading_spec:
+        if with_offloading:
             assert _offload_load_bytes() > load_bytes
 
 
 @pytest.mark.skipif(
-    not (current_platform.is_cuda() or current_platform.is_rocm()),
-    reason="HiSparse requires NVIDIA CUDA or AMD ROCm",
+    current_platform.get_hisparse_backend_cls() is None,
+    reason="HiSparse is not supported on this platform",
+)
+@fork_new_process_for_each_test
+def test_hisparse_extensible_kv_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_runner: type[VllmRunner],
+):
+    """An extensible KV cache serves HiSparse like a fixed one of its size.
+
+    Warmup must commit the hot blocks the FlashInfer decode autotune reads (a
+    top-k of 2048 reaches past the blocks backed at allocation) and keep the
+    hot group within its fixed-size block-table rows. The host pool stays in
+    host memory, and the caches passed to connectors match the fixed path's.
+    """
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major < 9:
+        pytest.skip("Sparse MLA requires Hopper or newer")
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_DEEP_GEMM_WARMUP", "skip")
+
+    def shrink_config(config):
+        config = _shrink_config(config)
+        config.update({"index_topk": 2048})
+        return config
+
+    def run(**kwargs) -> tuple[int, dict, list]:
+        with vllm_runner(
+            MODEL,
+            load_format="dummy",
+            hf_overrides=shrink_config,
+            attention_config=AttentionConfig(
+                hisparse_config=HiSparseConfig(device_buffer_size=2048)
+            ),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="HiSparseConnector",
+                kv_role="kv_both",
+                kv_connector_extra_config={"host_pool_gib": 1},
+            ),
+            block_size=64,
+            max_model_len=4096,
+            max_num_batched_tokens=4096,
+            max_num_seqs=4,
+            # Leaves room for the second engine while the first one's memory
+            # is still being released.
+            gpu_memory_utilization=0.4,
+            compilation_config={
+                "cudagraph_mode": "FULL_AND_PIECEWISE",
+                "cudagraph_capture_sizes": [1, 4],
+            },
+            **kwargs,
+        ) as runner:
+            worker = _get_hisparse_worker(runner)
+            assert worker.host_caches
+            assert not any(cache.is_cuda for cache in worker.host_caches)
+            engine_core = runner.llm.llm_engine.engine_core.engine_core
+            model_runner = engine_core.model_executor.driver_worker.worker.model_runner
+            caches = {
+                name: (
+                    cache.dtype,
+                    cache.device.type,
+                    tuple(cache.shape),
+                    cache.untyped_storage().nbytes(),
+                )
+                for name, cache in model_runner.kv_caches_by_layer.items()
+            }
+            outputs = [
+                runner.generate_greedy([prompt], max_tokens=16)[0] for prompt in prompts
+            ]
+            return model_runner.kv_cache_config.num_blocks, caches, outputs
+
+    prompts = [[1000 + i % 64 for i in range(2500)], [7, 8, 9]]
+    num_blocks, extensible_caches, extensible = run(enable_extensible_kv_cache=True)
+    _, fixed_caches, fixed = run(
+        enable_extensible_kv_cache=False, num_gpu_blocks_override=num_blocks
+    )
+
+    assert extensible_caches == fixed_caches
+    assert extensible == fixed
+
+
+@pytest.mark.skipif(
+    current_platform.get_hisparse_backend_cls() is None,
+    reason="HiSparse is not supported on this platform",
 )
 @fork_new_process_for_each_test
 def test_hisparse_host_exhaustion_defers_requests(
@@ -270,10 +360,9 @@ def test_hisparse_host_exhaustion_defers_requests(
     vllm_runner: type[VllmRunner],
 ):
     """A full host pool defers requests instead of leaving pages GPU-only."""
-    if current_platform.is_cuda():
-        capability = current_platform.get_device_capability()
-        if capability is None or capability.major < 9:
-            pytest.skip("Sparse MLA requires Hopper or newer")
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major < 9:
+        pytest.skip("Sparse MLA requires Hopper or newer")
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     monkeypatch.setenv("VLLM_DEEP_GEMM_WARMUP", "skip")
     prompts = [
@@ -283,8 +372,6 @@ def test_hisparse_host_exhaustion_defers_requests(
     with vllm_runner(
         MODEL,
         load_format="dummy",
-        # Avoid the independent AITER FP8 MoE scale overread (ROCm/aiter#5764).
-        kernel_config={"moe_backend": "triton"} if current_platform.is_rocm() else None,
         hf_overrides=_shrink_config,
         attention_config=AttentionConfig(
             hisparse_config=HiSparseConfig(device_buffer_size=512)
@@ -343,8 +430,8 @@ def test_hisparse_host_exhaustion_defers_requests(
 
 
 @pytest.mark.skipif(
-    not (current_platform.is_cuda() or current_platform.is_rocm()),
-    reason="HiSparse requires NVIDIA CUDA or AMD ROCm",
+    current_platform.get_hisparse_backend_cls() is None,
+    reason="HiSparse is not supported on this platform",
 )
 @fork_new_process_for_each_test
 def test_hisparse_terminal_prefix_reuse(
@@ -352,10 +439,9 @@ def test_hisparse_terminal_prefix_reuse(
     vllm_runner: type[VllmRunner],
 ):
     """Finished requests publish mirrored host KV after a late acknowledgement."""
-    if current_platform.is_cuda():
-        capability = current_platform.get_device_capability()
-        if capability is None or capability.major < 9:
-            pytest.skip("Sparse MLA requires Hopper or newer")
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major < 9:
+        pytest.skip("Sparse MLA requires Hopper or newer")
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     monkeypatch.setenv("VLLM_DEEP_GEMM_WARMUP", "skip")
     target = [1000 + i % 64 for i in range(257)]
@@ -363,8 +449,6 @@ def test_hisparse_terminal_prefix_reuse(
     with vllm_runner(
         MODEL,
         load_format="dummy",
-        # Avoid the independent AITER FP8 MoE scale overread (ROCm/aiter#5764).
-        kernel_config={"moe_backend": "triton"} if current_platform.is_rocm() else None,
         hf_overrides=_shrink_config,
         attention_config=AttentionConfig(
             hisparse_config=HiSparseConfig(

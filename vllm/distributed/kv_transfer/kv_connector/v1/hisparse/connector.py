@@ -31,12 +31,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetricT,
 )
 from vllm.logger import init_logger
-from vllm.v1.attention.backend import AttentionMetadata, max_decode_query_len
+from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
 from vllm.v1.hisparse.layout import get_hisparse_steady_state_concurrency
-from vllm.v1.hisparse.types import SparseKVOffloadCommand, SparseKVRowMirror
+from vllm.v1.hisparse.types import (
+    SparseKVOffloadCommand,
+    SparseKVResidencyUpdate,
+    SparseKVRowMirror,
+)
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
@@ -55,8 +59,8 @@ class HiSparseConnectorMetadata(KVConnectorMetadata):
     host_block_copies: tuple[KVCacheBlockCopy, ...]
     source_block_ids: tuple[int, ...]
     row_mirrors: dict[str, tuple[SparseKVRowMirror, ...]]
-    # A conservative hint for prefill; decode resolves residency on the GPU.
     all_context_pages_resident: bool
+    residency_updates: dict[str, SparseKVResidencyUpdate]
 
 
 @dataclass
@@ -94,12 +98,12 @@ class HiSparseConnectorScheduler:
         *,
         async_speculative: bool,
         draft_kv_lookahead: int = 0,
-        max_decode_query_len: int = 1,
+        import_step_tokens: int = 0,
     ) -> None:
         self.coordinator: HiSparseCoordinator | None = None
         self.async_speculative = async_speculative
         self.draft_kv_lookahead = draft_kv_lookahead
-        self.max_decode_query_len = max_decode_query_len
+        self.import_step_tokens = import_step_tokens
         self.requests: dict[str, Request] = {}
 
     def bind_coordinator(self, coordinator: HiSparseCoordinator) -> None:
@@ -115,6 +119,8 @@ class HiSparseConnectorScheduler:
         stats.record_host_usage(
             host_pool.get_usage(), len(self.coordinator.pending_spills)
         )
+        if host_pool.metrics_collector is not None:
+            stats.record_host_evictions(host_pool.metrics_collector.drain_events())
         return stats
 
     def build_connector_meta(
@@ -144,16 +150,13 @@ class HiSparseConnectorScheduler:
                 scheduler_output.num_scheduled_tokens.items()
             )
         )
-        # Runs first: it plans this step's transfers and table updates.
+        # Runs first: it plans this step's transfers and residency changes.
         self.coordinator.advance_scheduled(
             (
                 request_id,
                 min(start + count, self.requests[request_id].num_tokens),
             )
             for request_id, start, count in scheduled_requests
-        )
-        scheduler_output.block_table_updates = (
-            self.coordinator.take_block_table_updates() or None
         )
         command = self.coordinator.build_offload_command()
         host_block_copies = self.coordinator.take_host_block_copies()
@@ -192,11 +195,10 @@ class HiSparseConnectorScheduler:
             host_block_copies,
             tuple(source_block_ids),
             row_mirrors,
-            # The resident-prefill shortcut is not used by batches with decodes.
-            # Scanning every context page here otherwise makes each decode step
-            # scale with context length and the number of resident cache groups.
-            all(count > self.max_decode_query_len for _, _, count in scheduled_requests)
-            and self.coordinator.all_context_pages_resident(scheduled_requests),
+            self.coordinator.all_context_pages_resident(scheduled_requests),
+            self.coordinator.take_residency_updates(
+                scheduler_output.num_scheduled_tokens
+            ),
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -244,7 +246,13 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
                     and speculative_config is not None
                 ),
                 draft_kv_lookahead=vllm_config.num_lookahead_tokens,
-                max_decode_query_len=max_decode_query_len(vllm_config),
+                import_step_tokens=(
+                    1
+                    + vllm_config.num_speculative_tokens
+                    + vllm_config.num_lookahead_tokens
+                    if vllm_config.num_speculative_tokens
+                    else 0
+                ),
             )
             max_model_len = vllm_config.model_config.max_model_len
             steady_concurrency = get_hisparse_steady_state_concurrency(
@@ -266,7 +274,10 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
     def bind_kv_cache_manager(self, kv_cache_manager: KVCacheManager) -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.bind_coordinator(
-            get_hisparse_coordinator(kv_cache_manager)
+            get_hisparse_coordinator(
+                kv_cache_manager,
+                import_step_tokens=self.connector_scheduler.import_step_tokens,
+            )
         )
 
     @property
