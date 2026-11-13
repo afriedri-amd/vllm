@@ -1172,6 +1172,7 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
             reason = self._aiter_sparse_mla_unsupported_reason(vllm_config)
             if reason is None:
                 self.use_aiter_sparse_mla = True
+                logger.info_once("Using AITER Triton sparse MLA.")
             else:
                 logger.warning_once(
                     "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA is set, but %s; "
