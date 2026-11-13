@@ -1133,7 +1133,8 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
 
         vllm_config = get_current_vllm_config()
         self._attn_out_dtype = vllm_config.model_config.dtype
-        if isinstance(self.index_group, HiSparseMLAIndexGroup):
+        uses_hisparse = isinstance(self.index_group, HiSparseMLAIndexGroup)
+        if uses_hisparse:
             if kv_cache_dtype == "fp8_ds_mla":
                 raise ValueError(
                     "HiSparse on ROCm does not support the fp8_ds_mla KV cache "
@@ -1168,14 +1169,16 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                 f"model; got qk_rope_head_dim={self.qk_rope_head_dim}"
             )
 
-        if rocm_aiter_ops.is_triton_sparse_mla_enabled():
+        # HiSparse defaults to aiter's Triton kernel: its default ragged path is
+        # 2-3x slower, and both address rows with 64-bit offsets.
+        if rocm_aiter_ops.is_triton_sparse_mla_enabled(default=uses_hisparse):
             reason = self._aiter_sparse_mla_unsupported_reason(vllm_config)
             if reason is None:
                 self.use_aiter_sparse_mla = True
                 logger.info_once("Using AITER Triton sparse MLA.")
             else:
                 logger.warning_once(
-                    "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA is set, but %s; "
+                    "AITER Triton sparse MLA is enabled, but %s; "
                     "using the default sparse MLA path instead.",
                     reason,
                 )

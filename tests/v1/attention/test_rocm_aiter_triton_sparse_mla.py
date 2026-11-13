@@ -44,6 +44,22 @@ def test_triton_sparse_mla_gate(monkeypatch) -> None:
         assert enabled(aiter=True, flag=True) == on_gfx950()
         if not on_gfx950():
             assert "gfx950" in warnings.pop()
+
+        # An explicit flag beats the caller's default (HiSparse passes True).
+        monkeypatch.setenv("VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA", "0")
+        rocm_aiter_ops.refresh_env_variables()
+        assert not rocm_aiter_ops.is_triton_sparse_mla_enabled(default=True)
+        # Unset, the default decides, and falling back never warns.
+        monkeypatch.delenv("VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA")
+        rocm_aiter_ops.refresh_env_variables()
+        assert not rocm_aiter_ops.is_triton_sparse_mla_enabled()
+        assert rocm_aiter_ops.is_triton_sparse_mla_enabled(default=True) == (
+            on_gfx950()
+        )
+        monkeypatch.setenv("VLLM_ROCM_USE_AITER", "0")
+        rocm_aiter_ops.refresh_env_variables()
+        assert not rocm_aiter_ops.is_triton_sparse_mla_enabled(default=True)
+        assert not warnings
     finally:
         monkeypatch.undo()
         rocm_aiter_ops.refresh_env_variables()

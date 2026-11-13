@@ -2250,6 +2250,7 @@ class rocm_aiter_ops:
     # TODO: Consolidate under VLLM_ROCM_USE_AITER_ROPE
     _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
     _TRITON_SPARSE_MLA = envs.VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA
+    _TRITON_SPARSE_MLA_SET = envs.is_set("VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA")
     _FLYDSL_SPARSE_MLA = envs.VLLM_ROCM_USE_AITER_FLYDSL_SPARSE_MLA
     _FLYDSL_SPARSE_MLA_MIN_TOKENS = envs.VLLM_ROCM_AITER_FLYDSL_SPARSE_MLA_MIN_TOKENS
     # FlyDSL sparse MLA configs (heads, has_invalid, return_lse) that already
@@ -2284,6 +2285,9 @@ class rocm_aiter_ops:
         cls._LINEAR_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
         cls._TRITON_SPARSE_MLA = envs.VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA
+        cls._TRITON_SPARSE_MLA_SET = envs.is_set(
+            "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA"
+        )
         cls._FLYDSL_SPARSE_MLA = envs.VLLM_ROCM_USE_AITER_FLYDSL_SPARSE_MLA
         cls._FLYDSL_SPARSE_MLA_MIN_TOKENS = (
             envs.VLLM_ROCM_AITER_FLYDSL_SPARSE_MLA_MIN_TOKENS
@@ -2658,8 +2662,16 @@ class rocm_aiter_ops:
 
     @classmethod
     @if_aiter_supported
-    def is_triton_sparse_mla_enabled(cls) -> bool:
-        if not cls._TRITON_SPARSE_MLA:
+    def is_triton_sparse_mla_enabled(cls, default: bool = False) -> bool:
+        """Whether sparse MLA runs on aiter's Triton kernel.
+
+        Args:
+            default: The answer when VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA is
+                unset; an explicit setting always wins.
+
+        """
+        explicit = cls._TRITON_SPARSE_MLA_SET
+        if not (cls._TRITON_SPARSE_MLA if explicit else default):
             return False
         from vllm.platforms.rocm import on_gfx950
 
@@ -2669,6 +2681,8 @@ class rocm_aiter_ops:
             reason = "the kernel is gfx950-only"
         else:
             return True
+        if not explicit:
+            return False
         logger.warning_once(
             "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA is set, but %s; ignoring it.",
             reason,
